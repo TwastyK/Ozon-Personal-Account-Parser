@@ -15,10 +15,11 @@ def extract_all_data(data):
                     flatten(a, name + str(i) + '.')
                     i += 1
             else:
+                # ШАГ 1: РАСКРЫВАЕМ МАТРЕШКУ (как в твоем TXT)
                 if isinstance(x, str) and (x.startswith('{') or x.startswith('[')):
                     try:
                         sub_json = json.loads(x)
-                        flatten(sub_json, name)
+                        flatten(sub_json, name)  # Уходим вглубь
                     except:
                         out[name[:-1]] = x
                 else:
@@ -27,6 +28,7 @@ def extract_all_data(data):
         flatten(y)
         return out
 
+    # Сначала получаем ПОЛНУЮ плоскую карту всех данных
     flat_data = flatten_to_dict(data)
 
     res = {
@@ -35,82 +37,96 @@ def extract_all_data(data):
         "Состав": [],
         "Стоимость": "Не найдена",
         "Адрес": "Не найден",
-        "QR-код": "Нет QR"
+        "QR-код": "Нет QR",
+        "UF_CRM_OZON_SHIPMENT_DATE": "Н/Д",
+        "UF_CRM_OZON_BARCODE": "Н/Д",
+        "UF_CRM_OZON_IS": True,
+        "UF_CRM_OZON_DELIVERY": "Ozon",
+        "UF_CRM_OZON_POSTING_NUMBER": "Н/Д",
+        "UF_CRM_OZON_TRACK_NUMBER": "Н/Д",
+        "UF_CRM_OZON_STATUS": "Н/Д",
+        "UF_CRM_ROZORDERNUMBER": "Н/Д"
     }
 
     def clean(t):
         if not t: return ""
         t = re.sub('<[^<]+?>', '', str(t))
+        # Фильтр технических заголовков Ozon, которые не являются данными
+        bad_words = ["textPrimary", "ozTextPrimary", "ozParent", "main", "horizontal", "vertical"]
+        if any(w == t for w in bad_words): return ""
         return t.replace('\u2009', ' ').replace('\u202f', ' ').replace('\xa0', ' ').strip()
 
     shipment_map = {}
+    is_ready_by_widget = False
 
-    # --- НОВЫЕ ФЛАГИ ДЛЯ ТОЧНОГО СТАТУСА ---
-    is_ready_by_widget = False  # Флаг: найден ли виджет выдачи (QR)
-    found_main_status = ""  # Сюда сохраним заголовок, если он "сильный"
-
+    # ШАГ 2: ИДЕМ ПО КАРТЕ PATH (когда матрешка уже раскрыта)
     for key, value in flat_data.items():
         val_str = str(value)
-        k_low = key.lower()
 
-        # 1. ПРОВЕРКА НА ГОТОВНОСТЬ (receiptCode — это системное имя виджета выдачи)
-        if "receiptcode" in k_low or "qr-code" in val_str:
-            is_ready_by_widget = True
+        # 1. СТОИМОСТЬ (Твой путь: orderDoneTotal...total.right.price.text)
+        if "orderDoneTotal" in key and "total.right.price.text" in key:
+            val_cleaned = clean(val_str)
+            if val_cleaned: res["Стоимость"] = val_cleaned
 
-        # 2. ID ЗАКАЗА
-        if "order" in k_low and "-" in val_str:
-            oid = re.search(r'(\d{10}-\d{4})', val_str)
-            if oid: res["ID Заказа"] = oid.group(1)
+        # 2. БАРКОД / КОД ВЫДАЧИ (Твой путь: receiptCode...code.text)
+        if "receiptCode" in key and "code.text" in key:
+            res["UF_CRM_OZON_BARCODE"] = val_str
+            res["UF_CRM_OZON_TRACK_NUMBER"] = val_str  # Для Озона это по сути трек
 
-        # 3. СТОИМОСТЬ
-        if "₽" in val_str and any(x in k_low for x in ["price", "total", "amount"]):
-            res["Стоимость"] = clean(val_str)
+        # 3. ДАТА ДОСТАВКИ (Твой путь: shipmentWidget...header...text)
+        if "shipmentWidget" in key and "header" in key and "textIcon.text.text" in key:
+            val_cleaned = clean(val_str)
+            if val_cleaned: res["UF_CRM_OZON_SHIPMENT_DATE"] = val_cleaned
 
-        # 4. QR-КОД
+        # 4. НОМЕР ЗАКАЗА / ОТПРАВЛЕНИЯ (Чистим от ссылок)
+        if re.search(r'\d{10}-\d{4}', val_str):
+            match = re.search(r'(\d{10}-\d{4})', val_str)
+            if match:
+                oid = match.group(1)
+                res["ID Заказа"] = oid
+                res["UF_CRM_OZON_POSTING_NUMBER"] = oid
+                res["UF_CRM_ROZORDERNUMBER"] = oid
+
+        # 5. АДРЕС И QR (Старая добрая логика)
+        if any(word in val_str for word in ["Смолячкова", "ул.", "проспект"]) and len(val_str) > 10:
+            if not any(x in val_str for x in ["{", "http"]):
+                res["Адрес"] = clean(val_str)
+
         if "qr-code" in val_str and val_str.startswith('http'):
             res["QR-код"] = val_str
 
-        # 5. АДРЕС
-        if any(word in val_str for word in ["Смолячкова", "ул.", "проспект"]) and len(val_str) > 10:
-            if not any(x in val_str for x in ["{", "http", "main"]):
-                res["Адрес"] = clean(val_str)
+        # 6. СБОР СОСТАВА ТОВАРОВ
+        if "shipmentWidget" in key:
+            ship_id_match = re.search(r'shipmentWidget-[\d\w-]+', key)
+            if ship_id_match:
+                s_id = ship_id_match.group(0)
+                if s_id not in shipment_map:
+                    shipment_map[s_id] = {"status": "В ПУТИ", "items": []}
 
-        # 6. ТОВАРЫ И ПОЗИЦИОННЫЕ СТАТУСЫ
-        ship_id = re.search(r'shipmentWidget-[\d\w-]+', key)
-        if ship_id:
-            s_id = ship_id.group(0)
-            if s_id not in shipment_map:
-                shipment_map[s_id] = {"status": "В ПУТИ", "items": []}
+                if ".header." in key and ".text" in key:
+                    status_cand = clean(val_str).upper()
+                    if "ЗАБИРАТЬ" in status_cand or "ГОТОВ" in status_cand:
+                        is_ready_by_widget = True
+                    if status_cand: shipment_map[s_id]["status"] = status_cand
 
-            if ".header." in key and ".text" in key:
-                status_cand = clean(val_str).upper()
-                # Если в тексте есть "ЗАБИРАТЬ", помечаем заказ как готовый
-                if "ЗАБИРАТЬ" in status_cand or "ГОТОВ" in status_cand:
-                    is_ready_by_widget = True
+                if ".title.name.text" in key:
+                    item_name = clean(val_str)
+                    if len(item_name) > 10:
+                        shipment_map[s_id]["items"].append(item_name)
 
-                if any(s in status_cand for s in ["ПУТИ", "ЗАБИРАТЬ", "ДОСТАВЛЕНО", "ОЖИДАЕТ", "АПРЕЛЯ"]):
-                    shipment_map[s_id]["status"] = status_cand.replace("ИЗ ПУНКТА ВЫДАЧИ ", "")
-
-            if ".title.name.text" in key:
-                item_name = clean(val_str)
-                if len(item_name) > 10 and "textPrimary" not in item_name:
-                    shipment_map[s_id]["items"].append(item_name)
-
-    # --- СБОРКА И ФИНАЛЬНАЯ ЛОГИКА СТАТУСА ---
+    # Финальная сборка
     final_items = []
     for s_id, s_data in shipment_map.items():
         st = s_data["status"]
         for it in s_data["items"]:
             final_items.append(f"{it} — [{st}]")
+    res["Состав"] = list(dict.fromkeys(final_items))
 
-    res["Состав"] = list(dict.fromkeys(final_items)) if final_items else ["Товары не найдены"]
-
-    # ЛОГИКА ОПРЕДЕЛЕНИЯ ГЛАВНОГО СТАТУСА:
     if is_ready_by_widget:
-        # Если нашли receiptCode или слово "забирать" — игнорим даты, пишем ГОТОВО
         res["Статус"] = "МОЖНО ЗАБИРАТЬ"
     elif shipment_map:
-        # Если не готовы, берем статус первого отправления
         res["Статус"] = list(shipment_map.values())[0]["status"]
+
+    res["UF_CRM_OZON_STATUS"] = res["Статус"]
 
     return res
