@@ -1,0 +1,5 @@
+user_cookie/
+debug_json/
+last_state.json
+__pycache__/
+.env
